@@ -137,14 +137,14 @@ class AmexProcessor:
         Extract statement period from Page 1 using Gemini Vision (Image-based).
         This is much more robust than OCR + Regex for varied formats.
         """
-        # Crop header area (Top 40% should contain the period)
+        # Crop header area (Expanded to Top 50% to ensure we catch the date)
         w, h = page1_image.size
-        header_crop = page1_image.crop((0, 0, w, int(h * 0.40)))
+        header_crop = page1_image.crop((0, 0, w, int(h * 0.50)))
 
         # 1. Try Gemini Vision (Most Accurate)
         if self.model:
             prompt = """
-            この画像はクレジットカード明細書のヘッダー部分です。
+            この画像はクレジットカード明細書の1ページ目（ヘッダー部分）です。
             「ご利用期間(Statement Period)」または「明細書作成対象期間」の日付範囲を探して抽出してください。
             
             レスポンスは以下のJSON形式のみを返してください:
@@ -154,9 +154,9 @@ class AmexProcessor:
             }
             
             注意事項:
-            - 日付は必ず西暦(YYYY)に変換してください。
-            - 年の記載がない場合は、明細書の日付（作成日など）から推測して補完してください。近い過去の日付が正解の可能性が高いです。
-            - 見つからない場合は null を入れてください。
+            - 日付は必ず西暦(YYYY)に変換してください。 (例: 24/01/01 -> 2024/01/01)
+            - 期間が見つからない場合、単一に記載されている「作成日」「請求日」などの日付があれば、それを end_date とし、start_date はその1ヶ月前を推測して入れてください。
+            - 形式が特定できない場合は null を入れてください。
             """
             try:
                 response = self.model.generate_content(
@@ -180,28 +180,45 @@ class AmexProcessor:
                 print(f"Gemini Vision Extraction Failed: {e}")
                 # Fallthrough to legacy OCR method if LLM fails
 
-        # 2. Legacy OCR Fallback (Original Logic)
+        # 2. Legacy OCR Fallback (Original Logic + Enhanced Regex)
         print("Falling back to OCR for period extraction...")
         img_oa = self.enhance_image_for_ocr(header_crop)
         text = pytesseract.image_to_string(img_oa, lang="jpn+eng")
         
-        # Simple Regex Hunt as last resort
         dates = []
-        # Find all YYYY/MM/DD or YYYY年MM月DD日
-        matches = re.findall(r"20\d{2}[/\-年]\s?\d{1,2}[/\-月]\s?\d{1,2}", text)
-        for m in matches:
-            t = re.sub(r"[^\d]", "", m) # 20240101
-            if len(t) == 8:
+        # Support: 2024/01/01, 2024-01-01, 2024年1月1日, 2024.01.01, 24/01/01
+        patterns = [
+            r"(20\d{2})[/\-年.]\s?(\d{1,2})[/\-月.]\s?(\d{1,2})",  # 2024/01/01
+            r"(\d{2})[/\-.]\s?(\d{1,2})[/\-.]\s?(\d{1,2})"         # 24/01/01
+        ]
+        
+        for pat in patterns:
+            matches = re.findall(pat, text)
+            for m in matches:
                 try:
-                    d = datetime.date(int(t[:4]), int(t[4:6]), int(t[6:8]))
-                    dates.append(d)
+                    y_str, m_str, d_str = m
+                    
+                    # Year correction for 2-digit year
+                    if len(y_str) == 2:
+                        y_val = 2000 + int(y_str)
+                    else:
+                        y_val = int(y_str)
+                        
+                    d_obj = datetime.date(y_val, int(m_str), int(d_str))
+                    dates.append(d_obj)
                 except:
                     pass
         
         dates = sorted(list(set(dates)))
+        
+        # Heuristic: If we found dates, assume the period is the range encompassed
         if len(dates) >= 2:
-            # Assume earliest and latest in the header are the period (heuristic)
             return {"start": dates[0], "end": dates[-1]}
+        elif len(dates) == 1:
+            # If only one date found, assume it's the statement date (end)
+            end = dates[0]
+            start = end - datetime.timedelta(days=30) # Rough guess
+            return {"start": start, "end": end}
             
         return None
 

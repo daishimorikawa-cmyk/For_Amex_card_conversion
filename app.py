@@ -24,8 +24,13 @@ PDFをアップロードして、経費精算用CSV/TSVを作成します。
 # サイドバー設定
 with st.sidebar:
     st.header("設定")
-    env_api_key = os.getenv("GEMINI_API_KEY", "")
-    api_key_input = st.text_input("Gemini API Key", value=env_api_key, type="password")
+    # API Key Handling (Secure)
+    env_api_key = os.getenv("GEMINI_API_KEY")
+    if env_api_key:
+        st.success("✅ API Key loaded from .env")
+        api_key_input = env_api_key
+    else:
+        api_key_input = st.text_input("Gemini API Key", type="password")
     
     st.markdown("---")
     st.markdown("### 依存ツールパス設定")

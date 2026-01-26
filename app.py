@@ -36,8 +36,14 @@ with st.sidebar:
     st.markdown("### 依存ツールパス設定")
     
     # Defaults
-    default_tesseract = os.getenv("TESSERACT_CMD", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
-    default_poppler = os.getenv("POPPLER_PATH", r"C:\poppler-25.12.0\Library\bin")
+    # Defaults based on OS
+    if os.name == 'nt':
+        default_tesseract = os.getenv("TESSERACT_CMD", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+        default_poppler = os.getenv("POPPLER_PATH", r"C:\poppler-25.12.0\Library\bin")
+    else:
+        # Linux / Streamlit Cloud (Installed via packages.txt, usually in PATH)
+        default_tesseract = os.getenv("TESSERACT_CMD", "")
+        default_poppler = os.getenv("POPPLER_PATH", "")
     
     tesseract_cmd = st.text_input("Tesseract Path", value=default_tesseract)
     poppler_path = st.text_input("Poppler Bin Path", value=default_poppler)

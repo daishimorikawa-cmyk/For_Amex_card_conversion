@@ -35,6 +35,7 @@ class AmexProcessor:
     def convert_pdf_to_images(self, pdf_bytes: bytes) -> List[Image.Image]:
         """
         Convert PDF bytes to list of PIL Images using pdf2image.
+        Higher DPI (400) for better text recognition.
         """
         if convert_from_bytes is None:
             raise ImportError("pdf2image is not installed.")
@@ -42,7 +43,7 @@ class AmexProcessor:
         try:
             images = convert_from_bytes(
                 pdf_bytes,
-                dpi=300,
+                dpi=400,  # Increased from 300 for better quality
                 fmt="png",
                 poppler_path=self.poppler_path
             )
@@ -63,17 +64,42 @@ class AmexProcessor:
         img = img.point(lambda x: 0 if x < 140 else 255, "1")
         return img
 
+    def enhance_image_for_llm(self, image: Image.Image) -> Image.Image:
+        """
+        Enhance image for LLM processing (without binarization).
+        Keeps color information but improves contrast and sharpness.
+        """
+        from PIL import ImageFilter
+
+        # Enhance contrast (moderate)
+        enhancer = ImageEnhance.Contrast(image)
+        img = enhancer.enhance(1.3)
+
+        # Enhance sharpness
+        enhancer = ImageEnhance.Sharpness(img)
+        img = enhancer.enhance(1.5)
+
+        # Enhance brightness slightly
+        enhancer = ImageEnhance.Brightness(img)
+        img = enhancer.enhance(1.05)
+
+        return img
+
     def get_crop_candidates(self, width: int, height: int) -> List[Dict[str, int]]:
         """
         Generate multiple crop boxes to try.
         Focus is on top crop variance to avoid cutting the first row or keeping PII.
+        More conservative margins to ensure all data is captured.
         """
         candidates = []
-        ratios = [0.10, 0.13, 0.16, 0.20]
+        # More conservative top ratios to avoid cutting off first transaction
+        ratios = [0.08, 0.10, 0.12, 0.15]
 
-        left = int(width * 0.05)
-        right = int(width * 0.95)
-        bottom = int(height * 0.92)
+        # Slightly more conservative margins on sides
+        left = int(width * 0.03)
+        right = int(width * 0.97)
+        # More bottom area to capture all data
+        bottom = int(height * 0.95)
 
         for r in ratios:
             top = int(height * r)
@@ -86,6 +112,7 @@ class AmexProcessor:
         Try multiple crops, run quick OCR on each, and pick the one
         that captures the most 'Date' patterns (MM/DD) in the left column.
         Use that crop for the final LLM extraction.
+        Returns an enhanced image for better LLM recognition.
         """
         w, h = image.size
         candidates = self.get_crop_candidates(w, h)
@@ -106,6 +133,7 @@ class AmexProcessor:
             except Exception:
                 text = ""
 
+            # Count date patterns (MM/DD format)
             matches = re.findall(r"^\s*\d{1,2}/\d{1,2}", text, re.MULTILINE)
             score = len(matches)
 
@@ -113,20 +141,25 @@ class AmexProcessor:
                 max_score = score
                 best_crop = attempt
             elif score == max_score:
+                # Prefer smaller top crop (more content preserved)
                 if best_crop and attempt["ratio"] < best_crop["ratio"]:
                     best_crop = attempt
 
+        # Fallback with more conservative crop if no dates found
         if best_crop is None or max_score == 0:
-            top = int(h * 0.15)
-            left = int(w * 0.05)
-            right = int(w * 0.95)
-            bottom = int(h * 0.90)
-            return image.crop((left, top, right, bottom))
+            top = int(h * 0.10)  # More conservative default
+            left = int(w * 0.03)
+            right = int(w * 0.97)
+            bottom = int(h * 0.95)
+            cropped = image.crop((left, top, right, bottom))
+        else:
+            cropped = image.crop((
+                best_crop["left"], best_crop["top"],
+                best_crop["right"], best_crop["bottom"]
+            ))
 
-        final_img = image.crop((
-            best_crop["left"], best_crop["top"],
-            best_crop["right"], best_crop["bottom"]
-        ))
+        # Apply LLM-optimized enhancement (improves contrast without binarization)
+        final_img = self.enhance_image_for_llm(cropped)
         return final_img
 
     # ----------------------------
@@ -238,29 +271,40 @@ class AmexProcessor:
         if not self.model:
             raise ValueError("Gemini API Key is missing.")
 
-        # Prompt tailored for Japanese Amex Statement
+        # Improved prompt for Japanese Amex Statement with clearer instructions
         prompt = """
-        この画像はクレジットカードの利用明細の一部です。
-        以下の情報を抽出し、JSON形式のリストで返してください。
-        
-        抽出項目:
-        - date: 利用日 (MM/DD形式)
-        - description: ご利用店名・通信欄 (店舗名など)
-        - amount: 金額 (数値のみ抽出、円マークは削除。「-」が末尾にある場合はマイナスとして扱う)
-        
-        ルール:
-        - ヘッダー行や合計行（小計、合計など）は無視してください。
-        - ページ番号や「---」のような区切り線も無視してください。
-        - 1行に1つの明細があるとは限りません。レイアウトを解析してください。
-        - 日付が読み取れない行は無視してください。
-        
-        出力JSON形式:
+        あなたはクレジットカード明細の読み取りエキスパートです。
+        この画像はアメリカン・エキスプレス（Amex）のクレジットカード利用明細の一部です。
+
+        画像を注意深く読み取り、すべての取引明細を抽出してください。
+
+        ## 抽出項目（必須）:
+        1. date: 利用日 (MM/DD形式で抽出)
+        2. description: ご利用店名・ご利用先（店舗名、サービス名など）
+        3. amount: 金額（数字のみ、カンマや円マークは除去）
+
+        ## 重要なルール:
+        - 表の各行を1つずつ丁寧に読み取ってください
+        - 日付の列は左端にあります。「1/17」「12/05」などの形式です
+        - 店舗名は中央の列にあります。正確に読み取ってください
+        - 金額は右端の列にあります
+        - 金額の末尾に「-」がある場合（例: 1,000-）はマイナス値として扱います
+        - ヘッダー行（「ご利用日」「ご利用店名」などの見出し）は除外
+        - 合計行（「小計」「合計」「ご利用金額合計」など）は除外
+        - ページ番号や罫線は無視
+        - 空白行は無視
+
+        ## 出力形式（JSONリスト）:
         [
-          {"date": "12/01", "description": "セブンイレブン", "amount": 1000},
-          {"date": "12/05", "description": "Amazon.co.jp", "amount": 5500}
+          {"date": "1/17", "description": "Amazon.co.jp", "amount": 1500},
+          {"date": "1/20", "description": "セブン-イレブン 新宿店", "amount": 350},
+          {"date": "1/25", "description": "スターバックス", "amount": -500}
         ]
+
+        注意: descriptionは画像に表示されている通りに正確に抽出してください。
+        取引が見つからない場合は空のリスト [] を返してください。
         """
-        
+
         try:
             response = self.model.generate_content(
                 [prompt, image],
@@ -282,16 +326,28 @@ class AmexProcessor:
         except Exception as e:
             print(f"JSON Parse Error: {e}")
             return []
-            
+
+        # Ensure data is a list
+        if not isinstance(data, list):
+            print(f"Unexpected data format: {type(data)}")
+            return []
+
         final_list = []
         for item in data:
-            raw_date = item.get("date", "")
-            desc = item.get("description", "")
-            amount_val = item.get("amount")
-            
-            # Skip empty records
-            if not raw_date or not desc or amount_val is None:
+            if not isinstance(item, dict):
                 continue
+
+            raw_date = str(item.get("date", "")).strip()
+            desc = str(item.get("description", "")).strip()
+            amount_val = item.get("amount")
+
+            # Skip records without date or amount (description can be empty but logged)
+            if not raw_date or amount_val is None:
+                continue
+
+            # If description is empty, use placeholder but still include the record
+            if not desc:
+                desc = ""  # Will be logged as empty in app.py
                 
             # Clean Amount
             clean_amount = str(amount_val).replace(",", "").replace("¥", "").strip()

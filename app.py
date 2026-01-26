@@ -363,9 +363,20 @@ if uploaded_file is not None:
                 progress = (i / total_pages)
                 progress_bar.progress(progress)
 
+                # 画像情報をデバッグ
+                img_info = f"size={img.size}, mode={img.mode}"
+
                 # クロップなしで全画像をLLMに送信（より正確な抽出）
-                llm_response = processor.process_full_page_with_llm(img)
-                debug_info.append({"page": i, "response": llm_response[:500] if llm_response else "empty"})
+                try:
+                    llm_response = processor.process_full_page_with_llm(img)
+                except Exception as llm_err:
+                    llm_response = f"ERROR: {llm_err}"
+
+                debug_info.append({
+                    "page": i,
+                    "img_info": img_info,
+                    "response": llm_response[:500] if llm_response else "empty"
+                })
 
                 transactions = processor.parse_llm_response(
                     llm_response,
@@ -385,7 +396,8 @@ if uploaded_file is not None:
             # デバッグ情報（折りたたみ）
             with st.expander("🔍 デバッグ情報（LLMレスポンス）"):
                 for d in debug_info:
-                    st.text(f"Page {d['page']}: {d['response']}")
+                    st.markdown(f"**Page {d['page']}** ({d.get('img_info', 'N/A')})")
+                    st.code(d['response'], language='json')
 
             if not all_transactions:
                 st.error("有効な明細データが見つかりませんでした。")

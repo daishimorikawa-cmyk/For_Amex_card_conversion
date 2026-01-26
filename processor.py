@@ -2,7 +2,8 @@ import os
 import re
 import json
 import datetime
-from typing import List, Dict, Optional, Any
+import traceback
+from typing import List, Dict, Optional, Any, Tuple
 
 import pytesseract
 from PIL import Image, ImageOps, ImageEnhance
@@ -12,6 +13,26 @@ try:
     from pdf2image import convert_from_bytes
 except ImportError:
     convert_from_bytes = None
+
+
+class LLMResult:
+    """LLM処理結果を格納するクラス（エラー情報含む）"""
+    def __init__(self, success: bool, data: str = "[]", error: str = None,
+                 error_type: str = None, details: Dict = None):
+        self.success = success
+        self.data = data  # JSONレスポンス
+        self.error = error  # エラーメッセージ
+        self.error_type = error_type  # エラーの種類
+        self.details = details or {}  # 追加の詳細情報
+
+    def to_dict(self) -> Dict:
+        return {
+            "success": self.success,
+            "data": self.data,
+            "error": self.error,
+            "error_type": self.error_type,
+            "details": self.details
+        }
 
 
 class AmexProcessor:
@@ -84,6 +105,50 @@ class AmexProcessor:
         img = enhancer.enhance(1.05)
 
         return img
+
+    def resize_image_for_llm(self, image: Image.Image, max_size: int = 2048) -> Tuple[Image.Image, Dict]:
+        """
+        LLM送信用に画像をリサイズ（アスペクト比維持）
+
+        Args:
+            image: 元画像
+            max_size: 最大の幅または高さ（デフォルト2048px）
+
+        Returns:
+            Tuple[リサイズ後の画像, リサイズ情報の辞書]
+        """
+        original_size = image.size
+        width, height = original_size
+
+        resize_info = {
+            "original_size": original_size,
+            "resized": False,
+            "new_size": original_size,
+            "scale_factor": 1.0
+        }
+
+        # リサイズが必要かチェック
+        if width <= max_size and height <= max_size:
+            return image, resize_info
+
+        # アスペクト比を維持してリサイズ
+        if width > height:
+            scale = max_size / width
+        else:
+            scale = max_size / height
+
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+
+        resized_img = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+        resize_info.update({
+            "resized": True,
+            "new_size": (new_width, new_height),
+            "scale_factor": scale
+        })
+
+        return resized_img, resize_info
 
     def get_crop_candidates(self, width: int, height: int) -> List[Dict[str, int]]:
         """
@@ -264,24 +329,46 @@ class AmexProcessor:
     # ----------------------------
     # LLM Transaction Extraction
     # ----------------------------
-    def process_page_with_llm(self, image: Image.Image, use_crop: bool = False) -> str:
+    def process_page_with_llm(self, image: Image.Image, use_crop: bool = False) -> LLMResult:
         """
         Extract transactions using Gemini LLM.
         Args:
             image: PIL Image to process
             use_crop: If True, apply cropping. If False, use full image (recommended)
+
+        Returns:
+            LLMResult: 処理結果（成功/失敗、データ、エラー詳細を含む）
         """
+        details = {
+            "original_image_size": image.size,
+            "original_image_mode": image.mode,
+        }
+
         if not self.model:
-            raise ValueError("Gemini API Key is missing.")
+            return LLMResult(
+                success=False,
+                error="Gemini API Key が設定されていません",
+                error_type="API_KEY_MISSING",
+                details=details
+            )
 
-        # Convert to RGB mode for Gemini API compatibility
-        if image.mode != 'RGB':
-            processed_img = image.convert('RGB')
-        else:
-            processed_img = image
+        try:
+            # Convert to RGB mode for Gemini API compatibility
+            if image.mode != 'RGB':
+                processed_img = image.convert('RGB')
+                details["converted_to_rgb"] = True
+            else:
+                processed_img = image
+                details["converted_to_rgb"] = False
 
-        # Improved prompt for Japanese Amex Statement
-        prompt = """この画像はアメリカン・エキスプレス(AMEX)のクレジットカード利用明細書です。
+            # 画像をリサイズ（大きすぎる場合）
+            processed_img, resize_info = self.resize_image_for_llm(processed_img, max_size=2048)
+            details["resize_info"] = resize_info
+
+            details["final_image_size"] = processed_img.size
+
+            # Improved prompt for Japanese Amex Statement
+            prompt = """この画像はアメリカン・エキスプレス(AMEX)のクレジットカード利用明細書です。
 
 画像に含まれる全ての取引明細を抽出してJSON配列で返してください。
 
@@ -298,23 +385,135 @@ class AmexProcessor:
 [{"date": "6/25", "description": "AMAZON", "amount": 1500}]
 """
 
-        try:
+            # API呼び出し
+            details["api_call_started"] = True
             response = self.model.generate_content(
                 [prompt, processed_img],
                 generation_config={"response_mime_type": "application/json"}
             )
-            result = response.text
-            print(f"LLM Response: {result[:200]}...")  # Debug
-            return result
-        except Exception as e:
-            print(f"LLM Error: {e}")
-            return "[]"
+            details["api_call_completed"] = True
 
-    def process_full_page_with_llm(self, image: Image.Image) -> str:
+            # レスポンスの詳細を記録
+            details["response_candidates"] = len(response.candidates) if response.candidates else 0
+
+            # 安全性フィルタのチェック
+            if response.candidates:
+                candidate = response.candidates[0]
+                if hasattr(candidate, 'finish_reason'):
+                    details["finish_reason"] = str(candidate.finish_reason)
+                if hasattr(candidate, 'safety_ratings'):
+                    details["safety_ratings"] = [
+                        {"category": str(r.category), "probability": str(r.probability)}
+                        for r in candidate.safety_ratings
+                    ] if candidate.safety_ratings else []
+
+            # テキスト取得
+            result = response.text
+            details["response_length"] = len(result) if result else 0
+            details["response_preview"] = result[:500] if result else "empty"
+
+            # 空のレスポンスチェック
+            if not result or result.strip() == "[]" or result.strip() == "":
+                return LLMResult(
+                    success=True,  # API自体は成功
+                    data=result if result else "[]",
+                    error="LLMが空のレスポンスを返しました（明細が検出されなかった可能性）",
+                    error_type="EMPTY_RESPONSE",
+                    details=details
+                )
+
+            return LLMResult(
+                success=True,
+                data=result,
+                details=details
+            )
+
+        except AttributeError as e:
+            # レスポンスオブジェクトの問題
+            details["exception_type"] = "AttributeError"
+            details["exception_message"] = str(e)
+            details["traceback"] = traceback.format_exc()
+            return LLMResult(
+                success=False,
+                error=f"APIレスポンスの解析エラー: {e}",
+                error_type="RESPONSE_PARSE_ERROR",
+                details=details
+            )
+
+        except genai.types.BlockedPromptException as e:
+            # コンテンツがブロックされた
+            details["exception_type"] = "BlockedPromptException"
+            details["exception_message"] = str(e)
+            return LLMResult(
+                success=False,
+                error=f"コンテンツがブロックされました: {e}",
+                error_type="CONTENT_BLOCKED",
+                details=details
+            )
+
+        except genai.types.StopCandidateException as e:
+            # 生成が途中で停止
+            details["exception_type"] = "StopCandidateException"
+            details["exception_message"] = str(e)
+            return LLMResult(
+                success=False,
+                error=f"生成が途中で停止しました: {e}",
+                error_type="GENERATION_STOPPED",
+                details=details
+            )
+
+        except Exception as e:
+            # その他のエラー
+            error_type = type(e).__name__
+            details["exception_type"] = error_type
+            details["exception_message"] = str(e)
+            details["traceback"] = traceback.format_exc()
+
+            # 特定のエラーパターンを検出
+            error_str = str(e).lower()
+            if "quota" in error_str or "rate" in error_str:
+                return LLMResult(
+                    success=False,
+                    error=f"APIクォータ/レート制限エラー: {e}",
+                    error_type="QUOTA_EXCEEDED",
+                    details=details
+                )
+            elif "timeout" in error_str:
+                return LLMResult(
+                    success=False,
+                    error=f"APIタイムアウト: {e}",
+                    error_type="TIMEOUT",
+                    details=details
+                )
+            elif "invalid" in error_str and "key" in error_str:
+                return LLMResult(
+                    success=False,
+                    error=f"APIキーが無効です: {e}",
+                    error_type="INVALID_API_KEY",
+                    details=details
+                )
+            else:
+                return LLMResult(
+                    success=False,
+                    error=f"予期しないエラー ({error_type}): {e}",
+                    error_type="UNKNOWN_ERROR",
+                    details=details
+                )
+
+    def process_full_page_with_llm(self, image: Image.Image) -> LLMResult:
         """
         Process full page without cropping - recommended for better accuracy.
+
+        Returns:
+            LLMResult: 処理結果（成功/失敗、データ、エラー詳細を含む）
         """
         return self.process_page_with_llm(image, use_crop=False)
+
+    # 後方互換性のためのラッパー（文字列を返す）
+    def process_page_with_llm_legacy(self, image: Image.Image, use_crop: bool = False) -> str:
+        """Legacy wrapper that returns string only (for backward compatibility)"""
+        result = self.process_page_with_llm(image, use_crop)
+        return result.data
 
     def parse_llm_response(self, response_text: str, start_date: Optional[datetime.date] = None, end_date: Optional[datetime.date] = None) -> List[Dict[str, Any]]:
         """

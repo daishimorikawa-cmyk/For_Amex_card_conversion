@@ -5,7 +5,7 @@ import importlib.util
 import time
 import json
 import datetime
-from processor import AmexProcessor
+from processor import AmexProcessor, LLMResult
 import pytesseract
 from dotenv import load_dotenv
 
@@ -357,6 +357,7 @@ if uploaded_file is not None:
             # 3. 全ページ処理（ページ1から全て処理）
             all_transactions = []
             debug_info = []
+            error_pages = []  # エラーが発生したページを記録
 
             for i, img in enumerate(images, start=1):
                 status_text.markdown(f"**📖 ページ {i}/{total_pages} を処理中...**")
@@ -367,19 +368,34 @@ if uploaded_file is not None:
                 img_info = f"size={img.size}, mode={img.mode}"
 
                 # クロップなしで全画像をLLMに送信（より正確な抽出）
-                try:
-                    llm_response = processor.process_full_page_with_llm(img)
-                except Exception as llm_err:
-                    llm_response = f"ERROR: {llm_err}"
+                llm_result = processor.process_full_page_with_llm(img)
 
-                debug_info.append({
+                # デバッグ情報を収集
+                debug_entry = {
                     "page": i,
                     "img_info": img_info,
-                    "response": llm_response[:500] if llm_response else "empty"
-                })
+                    "success": llm_result.success,
+                    "error": llm_result.error,
+                    "error_type": llm_result.error_type,
+                    "response": llm_result.data[:500] if llm_result.data else "empty",
+                    "details": llm_result.details
+                }
+                debug_info.append(debug_entry)
+
+                # エラーチェック
+                if not llm_result.success:
+                    error_pages.append(i)
+                    st.error(f"ページ {i}: ❌ エラー発生 - {llm_result.error}")
+                    if llm_result.error_type:
+                        st.markdown(f"<span class='status-badge status-error'>エラー種別: {llm_result.error_type}</span>", unsafe_allow_html=True)
+                    continue
+
+                # 空レスポンスの警告
+                if llm_result.error_type == "EMPTY_RESPONSE":
+                    st.warning(f"ページ {i}: ⚠️ {llm_result.error}")
 
                 transactions = processor.parse_llm_response(
-                    llm_response,
+                    llm_result.data,
                     period_info['start'] if period_info else None,
                     period_info['end'] if period_info else None
                 )
@@ -393,11 +409,81 @@ if uploaded_file is not None:
             progress_bar.progress(1.0)
             status_text.markdown("**✅ 処理完了！**")
 
-            # デバッグ情報（折りたたみ）
-            with st.expander("🔍 デバッグ情報（LLMレスポンス）"):
+            # エラーサマリー表示
+            if error_pages:
+                st.error(f"⚠️ {len(error_pages)} ページでエラーが発生しました: ページ {', '.join(map(str, error_pages))}")
+
+            # デバッグ情報（折りたたみ）- 強化版
+            with st.expander("🔍 デバッグ情報（LLMレスポンス）", expanded=bool(error_pages)):
                 for d in debug_info:
-                    st.markdown(f"**Page {d['page']}** ({d.get('img_info', 'N/A')})")
-                    st.code(d['response'], language='json')
+                    page_num = d['page']
+                    is_error = not d.get('success', True)
+
+                    # ページヘッダー
+                    if is_error:
+                        st.markdown(f"### ❌ Page {page_num} - エラー")
+                    else:
+                        st.markdown(f"### ✅ Page {page_num}")
+
+                    # 基本情報
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown(f"**画像情報:** {d.get('img_info', 'N/A')}")
+                    with col2:
+                        st.markdown(f"**処理結果:** {'成功' if d.get('success') else '失敗'}")
+
+                    # エラー情報（エラーがある場合）
+                    if d.get('error'):
+                        st.markdown(f"**エラー:** `{d.get('error')}`")
+                    if d.get('error_type'):
+                        st.markdown(f"**エラー種別:** `{d.get('error_type')}`")
+
+                    # 詳細情報
+                    details = d.get('details', {})
+                    if details:
+                        with st.expander(f"📋 Page {page_num} 詳細情報"):
+                            # リサイズ情報
+                            resize_info = details.get('resize_info', {})
+                            if resize_info:
+                                st.markdown("**画像リサイズ情報:**")
+                                st.markdown(f"- 元サイズ: {resize_info.get('original_size', 'N/A')}")
+                                st.markdown(f"- リサイズ: {'実行' if resize_info.get('resized') else '不要'}")
+                                if resize_info.get('resized'):
+                                    st.markdown(f"- 新サイズ: {resize_info.get('new_size', 'N/A')}")
+                                    st.markdown(f"- スケール: {resize_info.get('scale_factor', 'N/A'):.2%}")
+
+                            # APIコール情報
+                            if details.get('api_call_started'):
+                                st.markdown(f"**API呼び出し:** {'完了' if details.get('api_call_completed') else '開始のみ'}")
+
+                            # レスポンス情報
+                            if details.get('response_candidates') is not None:
+                                st.markdown(f"**レスポンス候補数:** {details.get('response_candidates')}")
+                            if details.get('finish_reason'):
+                                st.markdown(f"**終了理由:** {details.get('finish_reason')}")
+                            if details.get('response_length') is not None:
+                                st.markdown(f"**レスポンス長:** {details.get('response_length')} 文字")
+
+                            # 安全性評価
+                            safety_ratings = details.get('safety_ratings', [])
+                            if safety_ratings:
+                                st.markdown("**安全性評価:**")
+                                for sr in safety_ratings:
+                                    st.markdown(f"- {sr.get('category', 'N/A')}: {sr.get('probability', 'N/A')}")
+
+                            # トレースバック（エラー時）
+                            if details.get('traceback'):
+                                st.markdown("**スタックトレース:**")
+                                st.code(details.get('traceback'), language='python')
+
+                            # 全詳細（JSON）
+                            st.markdown("**全詳細データ (JSON):**")
+                            st.json(details)
+
+                    # LLMレスポンス
+                    st.markdown("**LLMレスポンス:**")
+                    st.code(d.get('response', 'empty'), language='json')
+                    st.markdown("---")
 
             if not all_transactions:
                 st.error("有効な明細データが見つかりませんでした。")

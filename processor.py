@@ -274,40 +274,28 @@ class AmexProcessor:
         if not self.model:
             raise ValueError("Gemini API Key is missing.")
 
-        # Optionally apply enhancement without aggressive cropping
-        if use_crop:
-            processed_img = self.find_best_crop(image)
+        # Convert to RGB mode for Gemini API compatibility
+        if image.mode != 'RGB':
+            processed_img = image.convert('RGB')
         else:
-            # Just enhance the full image for better readability
-            processed_img = self.enhance_image_for_llm(image)
+            processed_img = image
 
         # Improved prompt for Japanese Amex Statement
-        prompt = """
-あなたはクレジットカード明細の読み取りエキスパートです。
-この画像はアメリカン・エキスプレス（Amex）のクレジットカード利用明細です。
+        prompt = """この画像はアメリカン・エキスプレス(AMEX)のクレジットカード利用明細書です。
 
-画像内のすべての取引明細（利用履歴）を抽出してください。
+画像に含まれる全ての取引明細を抽出してJSON配列で返してください。
 
-## 抽出項目:
-1. date: 利用日（MM/DD形式、例: 6/25, 7/03）
-2. description: ご利用店名・ご利用先（店舗名、サービス名）
-3. amount: 金額（数字のみ）
+抽出する項目:
+- date: 利用日 (例: "6/25", "7/03", "12/15")
+- description: 店舗名・利用先
+- amount: 金額（数値のみ、カンマなし）
 
-## 重要ルール:
-- 明細表の各行から「日付」「店舗名」「金額」を抽出
-- 日付形式: 「6/25」「7/03」「12/15」など
-- 金額が「1,234-」のように末尾にマイナス記号がある場合は、マイナス値（返金）
-- ヘッダー行（ご利用日、ご利用店名など）は除外
-- 合計行、小計行は除外
-- 「ご請求金額」「お支払い金額」などの合計は除外
+注意:
+- ヘッダー行や合計行は含めない
+- 金額末尾の「-」はマイナス値を意味する
 
-## 出力形式（JSON配列）:
-[
-  {"date": "6/25", "description": "AMAZON.CO.JP", "amount": 1500},
-  {"date": "7/03", "description": "東京電力EP", "amount": 8500}
-]
-
-画像に取引明細が見つからない場合は空配列 [] を返してください。
+出力例:
+[{"date": "6/25", "description": "AMAZON", "amount": 1500}]
 """
 
         try:
@@ -315,7 +303,9 @@ class AmexProcessor:
                 [prompt, processed_img],
                 generation_config={"response_mime_type": "application/json"}
             )
-            return response.text
+            result = response.text
+            print(f"LLM Response: {result[:200]}...")  # Debug
+            return result
         except Exception as e:
             print(f"LLM Error: {e}")
             return "[]"

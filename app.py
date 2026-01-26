@@ -14,7 +14,7 @@ load_dotenv()
 # ページ設定
 st.set_page_config(
     layout="wide",
-    page_title="Amex明細変換ツール",
+    page_title="AMEX明細変換ツール Ver.5.0",
     page_icon="💳",
     initial_sidebar_state="expanded"
 )
@@ -211,7 +211,7 @@ st.markdown("""
 # ヘッダー
 st.markdown("""
 <div class="main-header">
-    <h1>💳 Amex利用明細 PDF変換ツール</h1>
+    <h1>💳 AMEX利用明細 PDF変換ツール Ver.5.0</h1>
     <p>PDFをアップロードして、経費精算用CSV/TSVを簡単に作成</p>
 </div>
 """, unsafe_allow_html=True)
@@ -327,11 +327,12 @@ if uploaded_file is not None:
             pdf_bytes = uploaded_file.getvalue()
             images = processor.convert_pdf_to_images(pdf_bytes)
 
-            if len(images) < 2:
-                st.error("⚠️ ページ数が不足しています（2ページ以上必要です）。")
+            if len(images) < 1:
+                st.error("⚠️ PDFにページがありません。")
                 st.stop()
 
             total_pages = len(images)
+            st.info(f"📄 全 {total_pages} ページを検出しました")
 
             # 2. 期間抽出 (Page 1)
             status_text.markdown("**📅 1ページ目から期間を抽出中...**")
@@ -353,16 +354,18 @@ if uploaded_file is not None:
             else:
                 st.warning("⚠️ 期間の自動抽出に失敗しました。年補完は行われません。")
 
-            # 3. 各ページ処理
+            # 3. 全ページ処理（ページ1から全て処理）
             all_transactions = []
+            debug_info = []
 
-            for i, img in enumerate(images[1:], start=2):
+            for i, img in enumerate(images, start=1):
                 status_text.markdown(f"**📖 ページ {i}/{total_pages} を処理中...**")
                 progress = (i / total_pages)
                 progress_bar.progress(progress)
 
-                best_crop_img = processor.find_best_crop(img)
-                llm_response = processor.process_page_with_llm(best_crop_img)
+                # クロップなしで全画像をLLMに送信（より正確な抽出）
+                llm_response = processor.process_full_page_with_llm(img)
+                debug_info.append({"page": i, "response": llm_response[:500] if llm_response else "empty"})
 
                 transactions = processor.parse_llm_response(
                     llm_response,
@@ -371,10 +374,18 @@ if uploaded_file is not None:
                 )
 
                 if transactions:
+                    st.success(f"ページ {i}: {len(transactions)} 件の明細を抽出")
                     all_transactions.extend(transactions)
+                else:
+                    st.info(f"ページ {i}: 明細データなし（ヘッダーページまたは空）")
 
             progress_bar.progress(1.0)
             status_text.markdown("**✅ 処理完了！**")
+
+            # デバッグ情報（折りたたみ）
+            with st.expander("🔍 デバッグ情報（LLMレスポンス）"):
+                for d in debug_info:
+                    st.text(f"Page {d['page']}: {d['response']}")
 
             if not all_transactions:
                 st.error("有効な明細データが見つかりませんでした。")

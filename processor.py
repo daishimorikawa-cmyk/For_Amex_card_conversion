@@ -264,57 +264,67 @@ class AmexProcessor:
     # ----------------------------
     # LLM Transaction Extraction
     # ----------------------------
-    def process_page_with_llm(self, image: Image.Image) -> str:
+    def process_page_with_llm(self, image: Image.Image, use_crop: bool = False) -> str:
         """
         Extract transactions using Gemini LLM.
+        Args:
+            image: PIL Image to process
+            use_crop: If True, apply cropping. If False, use full image (recommended)
         """
         if not self.model:
             raise ValueError("Gemini API Key is missing.")
 
-        # Improved prompt for Japanese Amex Statement with clearer instructions
+        # Optionally apply enhancement without aggressive cropping
+        if use_crop:
+            processed_img = self.find_best_crop(image)
+        else:
+            # Just enhance the full image for better readability
+            processed_img = self.enhance_image_for_llm(image)
+
+        # Improved prompt for Japanese Amex Statement
         prompt = """
-        あなたはクレジットカード明細の読み取りエキスパートです。
-        この画像はアメリカン・エキスプレス（Amex）のクレジットカード利用明細の一部です。
+あなたはクレジットカード明細の読み取りエキスパートです。
+この画像はアメリカン・エキスプレス（Amex）のクレジットカード利用明細です。
 
-        画像を注意深く読み取り、すべての取引明細を抽出してください。
+画像内のすべての取引明細（利用履歴）を抽出してください。
 
-        ## 抽出項目（必須）:
-        1. date: 利用日 (MM/DD形式で抽出)
-        2. description: ご利用店名・ご利用先（店舗名、サービス名など）
-        3. amount: 金額（数字のみ、カンマや円マークは除去）
+## 抽出項目:
+1. date: 利用日（MM/DD形式、例: 6/25, 7/03）
+2. description: ご利用店名・ご利用先（店舗名、サービス名）
+3. amount: 金額（数字のみ）
 
-        ## 重要なルール:
-        - 表の各行を1つずつ丁寧に読み取ってください
-        - 日付の列は左端にあります。「1/17」「12/05」などの形式です
-        - 店舗名は中央の列にあります。正確に読み取ってください
-        - 金額は右端の列にあります
-        - 金額の末尾に「-」がある場合（例: 1,000-）はマイナス値として扱います
-        - ヘッダー行（「ご利用日」「ご利用店名」などの見出し）は除外
-        - 合計行（「小計」「合計」「ご利用金額合計」など）は除外
-        - ページ番号や罫線は無視
-        - 空白行は無視
+## 重要ルール:
+- 明細表の各行から「日付」「店舗名」「金額」を抽出
+- 日付形式: 「6/25」「7/03」「12/15」など
+- 金額が「1,234-」のように末尾にマイナス記号がある場合は、マイナス値（返金）
+- ヘッダー行（ご利用日、ご利用店名など）は除外
+- 合計行、小計行は除外
+- 「ご請求金額」「お支払い金額」などの合計は除外
 
-        ## 出力形式（JSONリスト）:
-        [
-          {"date": "1/17", "description": "Amazon.co.jp", "amount": 1500},
-          {"date": "1/20", "description": "セブン-イレブン 新宿店", "amount": 350},
-          {"date": "1/25", "description": "スターバックス", "amount": -500}
-        ]
+## 出力形式（JSON配列）:
+[
+  {"date": "6/25", "description": "AMAZON.CO.JP", "amount": 1500},
+  {"date": "7/03", "description": "東京電力EP", "amount": 8500}
+]
 
-        注意: descriptionは画像に表示されている通りに正確に抽出してください。
-        取引が見つからない場合は空のリスト [] を返してください。
-        """
+画像に取引明細が見つからない場合は空配列 [] を返してください。
+"""
 
         try:
             response = self.model.generate_content(
-                [prompt, image],
+                [prompt, processed_img],
                 generation_config={"response_mime_type": "application/json"}
             )
             return response.text
         except Exception as e:
-            # Fallback or Log
             print(f"LLM Error: {e}")
             return "[]"
+
+    def process_full_page_with_llm(self, image: Image.Image) -> str:
+        """
+        Process full page without cropping - recommended for better accuracy.
+        """
+        return self.process_page_with_llm(image, use_crop=False)
 
     def parse_llm_response(self, response_text: str, start_date: Optional[datetime.date] = None, end_date: Optional[datetime.date] = None) -> List[Dict[str, Any]]:
         """
